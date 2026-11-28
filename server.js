@@ -34,6 +34,15 @@ app.use((req, res, next) => { req.user = getUser(req); next(); });
 const needLogin = (req, res, next) => req.user ? next() : res.redirect('/login');
 const needAdmin = (req, res, next) => (req.user && req.user.role === 'admin') ? next() : res.redirect('/');
 const getCompany = uid => db.prepare('SELECT * FROM companies WHERE user_id=?').get(uid);
+
+// تقدير تكلفة التحليل بالجنيه (افتراض موثق في خطة العمل: 0.25 ج/صفحة للكراسة الرقمية، 1 ج/صفحة للممسوحة)
+function estimateCost(pages, chars) {
+  const p = Math.max(1, pages || 1);
+  const density = (chars || 0) / p;            // كثافة النص للصفحة: أقل من 200 حرف = ملف ممسوح يحتاج OCR
+  const scanned = density < 200;
+  const cost = scanned ? p * 1.0 : Math.max(15, p * 0.25);
+  return { pages: p, scanned, cost_egp: Math.round(cost * 100) / 100 };
+}
 const flash = (req) => (req.query.ok ? `<div class="flash ok">${V.esc(req.query.ok)}</div>` : '') + (req.query.err ? `<div class="flash err">${V.esc(req.query.err)}</div>` : '');
 
 // ——— الصفحة الرئيسية (تسويقية) ———
@@ -55,7 +64,7 @@ app.get('/', (req, res) => {
   <div class="card"><h2>⏰ تنبيهات المواعيد</h2><p>قائمة مواعيد نهائية مرتبة لكل المناقصات المطابقة لك، حتى لا تفوتك جلسة فتح مظاريف.</p></div>
   <div class="card"><h2>📝 مسودات التقديم</h2><p>مسودة خطاب تقديم وهيكل عرض فني من بياناتك الحقيقية المسجلة — للمراجعة، ولا يُقدَّم رسمياً إلا باعتمادك.</p></div>
   <div class="card"><h2>✅ قائمة مراجعة</h2><p>Checklist جاهزة لكل مناقصة: المستندات، التأمينات، خطوات التسليم — علّم عليها وأنت تجهز.</p></div>
-  <div class="card"><h2>📬 نشرة المناقصات المجانية</h2><p>ملخص دوري بأحدث المناقصات في قطاعك ومحافظتك — مجاناً وبدون اشتراك، حتى تتابع السوق قبل ما تشترك.</p></div>
+  <div class="card"><h2>📬 نشرة المناقصات المجانية</h2><p>ملخص دوري بأحدث المناقصات في قطاعك ومحافظتك — مجاناً وبدون اشتراك، حتى تتابع السوق قبل ما تشترك.</p><a class="btn ghost sm" href="/digest">اشترك في النشرة</a></div>
   <div class="card"><h2>🏆 أرشيف الترسيات <span class="pill">قريباً</span></h2><p>سجل تاريخي بنتائج الترسية والأسعار الفائزة كمرجع استرشادي عند التسعير — قيد الإعداد من المصادر العلنية الموثقة.</p></div>
 </div>
 <div class="card">
@@ -257,9 +266,10 @@ app.post('/tenders/:id/analyze', needLogin, upload.single('booklet'), async (req
     if (text.length < 50) return res.redirect(`/tenders/${t.id}?err=` + encodeURIComponent('تعذر استخراج نص من الـPDF — الملف قد يكون صوراً ممسوحة ضوئياً (خاصية OCR في خطة التطوير)'));
     const company = getCompany(req.user.id);
     const result = analyzeTenderText(text, t, company);
-    const info = db.prepare('INSERT INTO analyses (user_id,tender_id,filename,extracted,fit,created_at) VALUES (?,?,?,?,?,?)')
-      .run(req.user.id, t.id, req.file.originalname || 'booklet.pdf', JSON.stringify(result), JSON.stringify(result.fit), now());
-    logEvent(req.user.id, 'analysis', `tender ${t.id}`);
+    const cost = estimateCost(data.numpages || 1, text.length);
+    const info = db.prepare('INSERT INTO analyses (user_id,tender_id,filename,extracted,fit,created_at,pages,chars,cost_egp) VALUES (?,?,?,?,?,?,?,?,?)')
+      .run(req.user.id, t.id, req.file.originalname || 'booklet.pdf', JSON.stringify(result), JSON.stringify(result.fit), now(), cost.pages, text.length, cost.cost_egp);
+    logEvent(req.user.id, 'analysis', `tender ${t.id} · ${cost.pages}p · ${cost.cost_egp} EGP${cost.scanned ? ' · scanned' : ''}`);
     res.redirect('/analyses/' + info.lastInsertRowid);
   } catch (e) {
     res.redirect(`/tenders/${t.id}?err=` + encodeURIComponent('فشل التحليل: ' + e.message));
@@ -341,6 +351,37 @@ app.get('/alerts', needLogin, (req, res) => {
 <div class="card"><table><tr><th>المناقصة</th><th>الجهة</th><th>آخر موعد</th><th>المتبقي</th>${company ? '<th>ملاءمة</th>' : ''}</tr>
 ${rows.map(x => `<tr><td><a href="/tenders/${x.t.id}">${V.esc(x.t.title)}</a></td><td class="mut">${V.esc(x.t.entity)}</td><td>${V.esc(String(x.t.deadline_at).slice(0, 10))}</td><td>${V.deadlineBadge(x.t.deadline_at)}</td>${company ? `<td>${x.f.score ?? '—'}</td>` : ''}</tr>`).join('') || '<tr><td>لا مواعيد قادمة</td></tr>'}
 </table></div>`, req.user));
+});
+
+// ——— النشرة المجانية: التقاط الأسماء بدون حساب (طبقة الاكتساب) ———
+app.get('/digest', (req, res) => {
+  const count = db.prepare('SELECT COUNT(*) c FROM leads').get().c;
+  res.send(V.layout('النشرة المجانية', `${flash(req)}<div class="card" style="max-width:620px;margin:auto">
+<h1>📬 نشرة المناقصات المجانية</h1>
+<p>ملخص دوري بأحدث المناقصات في قطاعك ومحافظتك، من البوابة الحكومية الرسمية. مجاناً، وبدون حساب.</p>
+<form method="post" action="/digest">
+<label>وسيلة التواصل (واتساب أو بريد إلكتروني)</label><input name="contact" required placeholder="01xxxxxxxxx أو name@example.com">
+<label>طريقة التواصل</label><select name="channel"><option value="whatsapp">واتساب</option><option value="email">بريد إلكتروني</option></select>
+<label>القطاع</label><select name="sector">${V.SECTORS.map(s => `<option>${V.esc(s)}</option>`).join('')}</select>
+<label>المحافظة</label><select name="governorate">${V.GOVS.map(g => `<option>${V.esc(g)}</option>`).join('')}</select>
+<label>ملاحظة (اختياري): نوع المنتجات أو الخدمات التي توردها</label><input name="note">
+<button class="btn gold" style="margin-top:14px">اشترك في النشرة</button>
+</form>
+<p class="mut" style="margin-top:12px">نستخدم بياناتك لإرسال المناقصات المناسبة فقط، ولا نشاركها مع أي جهة. يمكنك طلب الإلغاء في أي وقت.</p>
+${count ? `<p class="mut">عدد المشتركين حتى الآن: ${count}</p>` : ''}
+</div>`, req.user));
+});
+
+app.post('/digest', (req, res) => {
+  const contact = String(req.body.contact || '').trim().slice(0, 120);
+  if (contact.length < 5) return res.redirect('/digest?err=' + encodeURIComponent('أدخل وسيلة تواصل صحيحة'));
+  const channel = req.body.channel === 'email' ? 'email' : 'whatsapp';
+  const dup = db.prepare('SELECT id FROM leads WHERE contact=?').get(contact);
+  if (dup) return res.redirect('/digest?ok=' + encodeURIComponent('أنت مشترك بالفعل — شكراً لك'));
+  db.prepare('INSERT INTO leads (contact,channel,sector,governorate,note,source,created_at) VALUES (?,?,?,?,?,?,?)')
+    .run(contact, channel, String(req.body.sector || '').slice(0, 80), String(req.body.governorate || '').slice(0, 80), String(req.body.note || '').slice(0, 300), 'digest', now());
+  logEvent(null, 'lead', `${channel}:${contact.slice(0, 6)}***`);
+  res.redirect('/digest?ok=' + encodeURIComponent('تم الاشتراك. أول نشرة توصلك مع أقرب دفعة.'));
 });
 
 // ——— الباقات والاشتراكات (تجريبي) ———
@@ -503,12 +544,42 @@ app.get('/admin/reports', needAdmin, (req, res) => {
   const byType = db.prepare('SELECT type, COUNT(*) c FROM events GROUP BY type ORDER BY c DESC').all();
   const daily = db.prepare("SELECT substr(ts,1,10) d, COUNT(*) c FROM events GROUP BY d ORDER BY d DESC LIMIT 14").all();
   const topSectors = db.prepare("SELECT sector, COUNT(*) c FROM tenders GROUP BY sector ORDER BY c DESC").all();
+  // هامش كل عميل: إيراد باقته مقابل تقدير تكلفة تحليلاته هذا الشهر
+  const margin = db.prepare(`SELECT u.id, u.email, c.name cname, p.name_ar plan, p.price_egp,
+      COALESCE((SELECT COUNT(*) FROM analyses a WHERE a.user_id=u.id AND a.created_at >= date('now','start of month')),0) uses,
+      COALESCE((SELECT SUM(a.cost_egp) FROM analyses a WHERE a.user_id=u.id AND a.created_at >= date('now','start of month')),0) cost
+    FROM users u
+    LEFT JOIN companies c ON c.user_id=u.id
+    LEFT JOIN subscriptions s ON s.user_id=u.id AND s.status='active'
+    LEFT JOIN plans p ON p.id=s.plan_id
+    WHERE p.id IS NOT NULL ORDER BY p.price_egp DESC`).all();
+  const leadsCount = db.prepare('SELECT COUNT(*) c FROM leads').get().c;
   res.send(V.layout('تقارير', `<a href="/admin">→ الإدارة</a>
+<div class="grid g4">
+<div class="card"><h3>مشتركو النشرة</h3><div class="score">${leadsCount}</div><a href="/admin/leads">القائمة</a></div>
+<div class="card"><h3>إجمالي التحليلات</h3><div class="score">${db.prepare('SELECT COUNT(*) c FROM analyses').get().c}</div></div>
+<div class="card"><h3>تقدير تكلفة التحليلات (الشهر)</h3><div class="score">${Math.round(db.prepare("SELECT COALESCE(SUM(cost_egp),0) s FROM analyses WHERE created_at >= date('now','start of month')").get().s)} ج</div></div>
+<div class="card"><h3>متوسط صفحات الكراسة</h3><div class="score">${Math.round(db.prepare('SELECT COALESCE(AVG(pages),0) a FROM analyses').get().a)}</div></div>
+</div>
+<div class="card"><h2>هامش كل عميل (الشهر الحالي)</h2>
+<p class="mut">الإيراد = سعر الباقة. التكلفة = تقدير تحليلات الشهر (0.25 ج/صفحة رقمية، 1 ج/صفحة ممسوحة). الهامش = الفرق.</p>
+<table><tr><th>العميل</th><th>الباقة</th><th>الإيراد</th><th>تحليلات</th><th>تكلفة تقديرية</th><th>الهامش</th><th>نسبة الهامش</th></tr>
+${margin.map(m => { const net = m.price_egp - m.cost; const pct = m.price_egp ? Math.round(net / m.price_egp * 100) : 0; return `<tr><td>${V.esc(m.cname || m.email)}</td><td>${V.esc(m.plan)}</td><td>${m.price_egp} ج</td><td>${m.uses}</td><td>${Math.round(m.cost)} ج</td><td><b>${Math.round(net)} ج</b></td><td><span class="tag ${pct >= 70 ? 'ok' : pct >= 40 ? 'warn' : 'bad'}">${pct}%</span></td></tr>`; }).join('') || '<tr><td colspan="7">لا يوجد مشتركون بعد</td></tr>'}
+</table></div>
 <div class="grid g3">
 <div class="card"><h2>الأحداث حسب النوع</h2><table><tr><th>الحدث</th><th>العدد</th></tr>${byType.map(r => `<tr><td>${V.esc(r.type)}</td><td>${r.c}</td></tr>`).join('')}</table></div>
 <div class="card"><h2>النشاط اليومي (آخر 14 يوم)</h2><table><tr><th>اليوم</th><th>الأحداث</th></tr>${daily.map(r => `<tr><td>${r.d}</td><td>${r.c}</td></tr>`).join('') || '<tr><td>—</td></tr>'}</table></div>
 <div class="card"><h2>المناقصات حسب القطاع</h2><table><tr><th>القطاع</th><th>العدد</th></tr>${topSectors.map(r => `<tr><td>${V.esc(r.sector)}</td><td>${r.c}</td></tr>`).join('')}</table></div>
 </div>`, req.user));
+});
+
+// قائمة مشتركي النشرة (طبقة الاكتساب)
+app.get('/admin/leads', needAdmin, (req, res) => {
+  const rows = db.prepare('SELECT * FROM leads ORDER BY id DESC LIMIT 500').all();
+  res.send(V.layout('مشتركو النشرة', `<a href="/admin">→ الإدارة</a><div class="card"><h1>مشتركو النشرة المجانية (${rows.length})</h1>
+<table><tr><th>#</th><th>التواصل</th><th>القناة</th><th>القطاع</th><th>المحافظة</th><th>ملاحظة</th><th>التاريخ</th></tr>
+${rows.map(l => `<tr><td>${l.id}</td><td dir="ltr" style="text-align:right">${V.esc(l.contact)}</td><td>${V.esc(l.channel)}</td><td>${V.esc(l.sector)}</td><td>${V.esc(l.governorate)}</td><td class="mut">${V.esc(l.note)}</td><td class="mut">${V.esc(String(l.created_at).slice(0, 16).replace('T', ' '))}</td></tr>`).join('') || '<tr><td colspan="7">لا مشتركين بعد</td></tr>'}
+</table></div>`, req.user));
 });
 
 // تحميل كراسة الشروط التجريبية لتجربة التحليل
