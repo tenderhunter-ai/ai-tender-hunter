@@ -94,7 +94,25 @@ CREATE TABLE IF NOT EXISTS events (
   meta TEXT DEFAULT '',
   ts TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS leads (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  contact TEXT NOT NULL,
+  channel TEXT NOT NULL DEFAULT 'whatsapp',
+  sector TEXT DEFAULT '',
+  governorate TEXT DEFAULT '',
+  note TEXT DEFAULT '',
+  source TEXT DEFAULT 'digest',
+  created_at TEXT NOT NULL
+);
 `);
+
+// ترقية آمنة: أعمدة قياس استخدام التحليل (تُضاف مرة واحدة فقط)
+try {
+  const cols = db.prepare("PRAGMA table_info(analyses)").all().map(c => c.name);
+  if (!cols.includes('pages')) db.exec('ALTER TABLE analyses ADD COLUMN pages INTEGER DEFAULT 0');
+  if (!cols.includes('chars')) db.exec('ALTER TABLE analyses ADD COLUMN chars INTEGER DEFAULT 0');
+  if (!cols.includes('cost_egp')) db.exec('ALTER TABLE analyses ADD COLUMN cost_egp REAL DEFAULT 0');
+} catch (e) { /* الجدول يُنشأ في أول تشغيل */ }
 
 const now = () => new Date().toISOString();
 
